@@ -458,7 +458,7 @@ test("regression: in-flight queue executions finish within drain timeout", async
 
 test("regression: drain timeout bounds shutdown and force-closes hanging connections", async () => {
   // Create an HTTP server that hangs indefinitely on a specific path
-  const hangingServer = http.createServer((_req, res) => {
+  const hangingServer = http.createServer((_req, _res) => {
     // Deliberately never write or end response to simulate hanging request
   });
 
