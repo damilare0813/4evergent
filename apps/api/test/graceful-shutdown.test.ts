@@ -4,7 +4,6 @@ import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import http from "node:http";
 import {
   parseShutdownTimeout,
   registerShutdownHandlers,
@@ -453,73 +452,117 @@ test("regression: in-flight queue executions finish within drain timeout", async
 });
 
 // ---------------------------------------------------------------------------
-// 6. Regression test: drain timeout force-closes connections when an active request hangs
+// 6. Regression test: actual createApiServer() shutdown path
 // ---------------------------------------------------------------------------
 
-test("regression: drain timeout bounds shutdown and force-closes hanging connections", async () => {
-  // Create an HTTP server that hangs indefinitely on a specific path
-  const hangingServer = http.createServer((_req, _res) => {
-    // Deliberately never write or end response to simulate hanging request
-  });
-
-  await new Promise<void>((resolve) => hangingServer.listen(0, "127.0.0.1", resolve));
-  const port = (hangingServer.address() as any).port;
-
-  const mockApiServer = {
-    close: (options?: { drainTimeoutMs?: number }) =>
-      new Promise<void>((resolve) => {
-        hangingServer.closeIdleConnections?.();
-        const drainTimeout = options?.drainTimeoutMs ?? 50;
-        const timer = setTimeout(() => {
-          hangingServer.closeAllConnections?.();
-          resolve();
-        }, drainTimeout);
-
-        hangingServer.close(() => {
-          clearTimeout(timer);
-          resolve();
-        });
-      }),
-  };
-
-  const fakeProcess = new EventEmitter() as any;
-  let exitCode: number | null = null;
-  const errorLogs: string[] = [];
-
-  const registration = registerShutdownHandlers(mockApiServer, {
-    drainTimeoutMs: 50, // Short timeout for test
-    processObj: fakeProcess,
-    logger: {
-      log: () => {},
-      error: (msg) => errorLogs.push(msg),
-    },
-    onExit: (code) => {
-      exitCode = code;
-    },
-  });
-
-  try {
-    // Start hanging HTTP request
-    const hangingReqPromise = fetch(`http://127.0.0.1:${port}/hang`);
-
-    await new Promise((r) => setTimeout(r, 10));
-    fakeProcess.emit("SIGTERM");
-
-    // The hanging request should be severed by closeAllConnections once the drain timeout expires
-    await assert.rejects(async () => {
-      await hangingReqPromise;
+test("regression: actual createApiServer() shutdown path force-exits with code 1 when drain deadline is exceeded, and 0 on normal shutdown", async () => {
+  // Case 1: Active request hangs and exceeds drain deadline -> must force-exit with code 1
+  {
+    const server = await createApiServer({
+      port: 0,
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      signer: new MockSigner(),
+      authProvider: {
+        authenticate: async ({ headers }) => {
+          if (headers["x-hang"] === "true") {
+            // Hang indefinitely to simulate an in-flight request exceeding drain deadline
+            await new Promise(() => {});
+          }
+          return { ownerId: "test", subject: "test" };
+        },
+      },
     });
 
-    await new Promise((r) => setTimeout(r, 80));
-    assert.equal(exitCode, 1, "should force-exit with code 1 when timeout is exceeded");
-    assert.ok(
-      errorLogs.some((l) => l.includes("Shutdown timeout of 50ms exceeded — forcing exit")),
-      "should log shutdown timeout warning"
-    );
-  } finally {
-    registration.unregister();
-    hangingServer.closeAllConnections?.();
-    await new Promise((r) => hangingServer.close(() => r()));
+    await server.listen(0, "127.0.0.1");
+    const port = (server.server.address() as any).port;
+
+    const fakeProcess = new EventEmitter() as any;
+    let exitCode: number | null = null;
+    const errorLogs: string[] = [];
+
+    const registration = registerShutdownHandlers(server, {
+      drainTimeoutMs: 50, // Short timeout for test
+      processObj: fakeProcess,
+      logger: {
+        log: () => {},
+        error: (msg) => errorLogs.push(msg),
+      },
+      onExit: (code) => {
+        exitCode = code;
+      },
+    });
+
+    try {
+      // Start request that hangs during authentication
+      const hangingReqPromise = fetch(`http://127.0.0.1:${port}/agents`, {
+        headers: { "x-hang": "true" },
+      });
+
+      // Allow request socket to connect and enter handler
+      await new Promise((r) => setTimeout(r, 10));
+      fakeProcess.emit("SIGTERM");
+
+      // The hanging connection must be destroyed when drain timeout expires
+      await assert.rejects(async () => {
+        await hangingReqPromise;
+      });
+
+      // Wait for shutdown handler to exit
+      for (let i = 0; i < 25 && exitCode === null; i++) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+
+      assert.equal(exitCode, 1, "exceeded drain deadline on actual createApiServer() must exit with code 1");
+      assert.ok(
+        errorLogs.some((l) => l.includes("Shutdown timeout of 50ms exceeded — forcing exit")),
+        "should log shutdown timeout warning"
+      );
+    } finally {
+      registration.unregister();
+    }
+  }
+
+  // Case 2: Normal graceful shutdown on actual createApiServer() exits with code 0
+  {
+    const server = await createApiServer({
+      port: 0,
+      horizonUrl: "https://horizon-testnet.stellar.org",
+      signer: new MockSigner(),
+      authProvider: new DevAuthProvider({ defaultOwnerId: "test" }),
+    });
+
+    await server.listen(0, "127.0.0.1");
+    const port = (server.server.address() as any).port;
+
+    const fakeProcess = new EventEmitter() as any;
+    let exitCode: number | null = null;
+
+    const registration = registerShutdownHandlers(server, {
+      drainTimeoutMs: 5_000,
+      processObj: fakeProcess,
+      onExit: (code) => {
+        exitCode = code;
+      },
+    });
+
+    try {
+      // Send a request that finishes normally
+      const reqPromise = fetch(`http://127.0.0.1:${port}/health`);
+      await new Promise((r) => setTimeout(r, 2));
+
+      fakeProcess.emit("SIGTERM");
+
+      const res = await reqPromise;
+      assert.equal(res.status, 200);
+
+      for (let i = 0; i < 25 && exitCode === null; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      assert.equal(exitCode, 0, "normal graceful shutdown on actual createApiServer() must exit with code 0");
+    } finally {
+      registration.unregister();
+    }
   }
 });
 

@@ -226,10 +226,14 @@ export function registerShutdownHandlers(
       if (!timedOut) {
         exitFn(0);
       }
-    } catch (err) {
+    } catch (err: any) {
       clearTimeout(timer);
-      logger.error(`[4evergent] Error during shutdown:`, err);
       if (!timedOut) {
+        if (err?.name === "ShutdownTimeoutError" || err?.message?.includes("Shutdown timeout")) {
+          logger.error(`[4evergent] Shutdown timeout of ${drainTimeoutMs}ms exceeded — forcing exit`);
+        } else {
+          logger.error(`[4evergent] Error during shutdown:`, err);
+        }
         exitFn(1);
       }
     }

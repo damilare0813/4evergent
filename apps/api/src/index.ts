@@ -1785,10 +1785,15 @@ export async function createApiServer(options: ServerOptions) {
         if (drainTimeout !== undefined && drainTimeout > 0) {
           drainTimer = setTimeout(() => {
             if (completed) return;
+            completed = true;
+            clearInterval(idleInterval);
+            drainTimer = null;
             // 3. Force-close remaining connections and terminate outstanding work after timeout expires.
             server.closeAllConnections?.();
             executionQueue?.abortInFlight();
-            finish();
+            const err = new Error(`Shutdown timeout of ${drainTimeout}ms exceeded — forcing exit`);
+            err.name = "ShutdownTimeoutError";
+            reject(err);
           }, drainTimeout);
         }
 
