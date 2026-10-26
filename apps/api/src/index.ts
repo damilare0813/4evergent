@@ -258,13 +258,30 @@ export async function createApiServer(options: ServerOptions) {
   type DependencyChecks = { horizon: "ok" | "fail"; database: "ok" | "fail" };
   let readinessCache: { checks: DependencyChecks; expiresAt: number } | null = null;
   let readinessInFlight: Promise<DependencyChecks> | null = null;
+  // A check that ignores its abort signal keeps running after it times out.
+  // Later probes wait on that same call instead of starting another, so a hung
+  // dependency holds at most one outstanding call per check, however many
+  // probes arrive.
+  const outstandingChecks = new Map<string, { work: Promise<unknown>; controller: AbortController }>();
 
-  async function boundedCheck(check: (signal: AbortSignal) => Promise<unknown>): Promise<"ok" | "fail"> {
-    const controller = new AbortController();
+  async function boundedCheck(name: string, check: (signal: AbortSignal) => Promise<unknown>): Promise<"ok" | "fail"> {
+    let entry = outstandingChecks.get(name);
+    if (!entry) {
+      const controller = new AbortController();
+      const work = Promise.resolve().then(() => check(controller.signal));
+      const started = { work, controller };
+      const settle = () => {
+        if (outstandingChecks.get(name) === started) outstandingChecks.delete(name);
+      };
+      work.then(settle, settle);
+      outstandingChecks.set(name, started);
+      entry = started;
+    }
+    const { work, controller } = entry;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        Promise.resolve().then(() => check(controller.signal)),
+        work,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             controller.abort();
@@ -288,13 +305,13 @@ export async function createApiServer(options: ServerOptions) {
     if (readinessInFlight) return readinessInFlight;
     readinessInFlight = (async () => {
       const [horizon, database] = await Promise.all([
-        boundedCheck(async signal => {
+        boundedCheck("horizon", async signal => {
           const fetcher = options.readiness?.fetcher ?? globalThis.fetch;
           const probeAdapter = new StellarAdapter(options.horizonUrl,
             (input, init) => fetcher(input, { ...init, signal }));
           await probeAdapter.getNetworkInfo();
         }),
-        boundedCheck(async () => {
+        boundedCheck("database", async () => {
           // Exercise the actual configured stores, including injected/in-memory
           // stores, rather than a new connection that could hide a broken handle.
           await Promise.all([

@@ -95,6 +95,29 @@ test("readiness: store failures and store timeouts are unavailable", async () =>
   }
 });
 
+test("readiness: checks that ignore abort do not pile up across probes", async () => {
+  let fetches = 0;
+  let reads = 0;
+  const store = new InMemoryActivityStore();
+  store.listAll = async () => { reads++; return new Promise(() => {}); };
+  const { api, get } = await start({ activityStore: store, readiness: {
+    timeoutMs: 10, cacheMs: 1,
+    fetcher: async () => { fetches++; return new Promise<Response>(() => {}); },
+  } });
+  try {
+    for (let i = 0; i < 5; i++) {
+      const res = await get();
+      assert.equal(res.status, 503);
+      const body = await res.json() as any;
+      assert.equal(body.checks.horizon, "fail");
+      assert.equal(body.checks.database, "fail");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(fetches, 1);
+    assert.equal(reads, 1);
+  } finally { await api.close(); }
+});
+
 test("readiness: concurrent probes share a check; cached failures expire", async () => {
   let calls = 0;
   const { api, get } = await start({ readiness: { cacheMs: 40, fetcher: async () => {

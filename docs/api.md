@@ -204,7 +204,9 @@ availability exercises bounded reads on the actual activity, approval, schedule,
 execution, agent, and policy stores (SQLite, injected, or in-memory); it does not
 prove that writes will succeed. Dependency checks run concurrently with a 2-second
 budget each, abort network requests on timeout, and cache successes **and failures**
-for 5 seconds. Concurrent probes share one check. Worker status is read fresh on
+for 5 seconds. Concurrent probes share one check. A dependency call that ignores
+cancellation and is still running after its timeout is reused by later probes, so
+a hung dependency never has more than one outstanding call per check. Worker status is read fresh on
 every response. `ServerOptions.readiness` permits timeout/cache durations and a
 fetcher override for offline tests. Signer funding and dashboard changes remain
 outside this readiness contract.
